@@ -1,14 +1,17 @@
-#define _GNU_SOURCE
 #include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <linux/input.h>
 #include <stdlib.h>
-#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
 #include <errno.h>
-#include <math.h>
+#include <string.h>
 #include <time.h>
+#include <math.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <dirent.h>
+#include <ctype.h>
 
 #define KEY_MENU_LONG 312 // BTN_TL2
 #define KEY_VOLUP 115     // KEY_VOLUMEUP
@@ -16,49 +19,189 @@
 #define MAX_STEPS 10
 #define MAX_VOLUME 31
 
-// Tabla de brillo posibles valores
-static int brightness_values[8] = {5, 10, 20, 50, 70, 140, 200, 255};
-static int brightness_level = 3; // nivel índice en brightness_values (0-7)
-static int menu_long_pressed = 0;
-static int brightness_get_supported = -1; // -1: no probado, 0: no soportado, 1: soportado
+#define MAX_PATH_SIZE 512
 
-// Variables para debouncing y rate limiting
+// Archivos de persistencia
+#define VOLUME_PERSIST_FILE "/tmp/.keymon_volume"
+#define LAST_PROCESS_FILE "/tmp/.keymon_lastproc"
+
+// Configuración de monitoreo
+#define PROCESS_CHECK_INTERVAL 2  // segundos entre verificaciones de procesos
+#define MAX_PROC_NAME 64
+#define MAX_IGNORED_PROCS 20
+
+// Tabla de brillo
+static int brightness_values[8] = {5, 10, 20, 50, 70, 140, 200, 255};
+static int brightness_level = 3;
+static int menu_long_pressed = 0;
+static int brightness_get_supported = -1;
+
+// Variables de timing
 static struct timespec last_brightness_change = {0, 0};
 static struct timespec last_menu_event = {0, 0};
+static struct timespec last_volume_change = {0, 0};
+static time_t last_process_check = 0;
+
+// Control de volumen
+static int persistent_volume_step = 3;
+static int skip_next_restore = 0;
+
+static const char* ignored_processes[] = {
+    "keymon", "init", "kthreadd", "ksoftirqd", 
+    "migration", "rcu_", "systemd", "dbus", "getty", "sshd",
+    "kernel", "worker", "irq/", "mmcqd", "jbd2", "ext4-", 
+    "led_workqueue", "cfg80211", "wpa_supplicant", "dhcpcd",
+    "NetworkManager", "chronyd", "rsyslog", "cron", "bash", "sh"
+};
 
 #define DISP_LCD_SET_BRIGHTNESS 0x102
 #define DISP_LCD_GET_BRIGHTNESS 0x103
 
 // Constantes de timing (en nanosegundos)
-#define MIN_BRIGHTNESS_INTERVAL_NS 150000000  // 150ms entre cambios de brillo
-#define MIN_MENU_DEBOUNCE_NS 50000000        // 50ms debounce para MENU
-#define IOCTL_RETRY_DELAY_US 10000          // 10ms delay entre reintentos
+#define MIN_BRIGHTNESS_INTERVAL_NS 150000000  
+#define MIN_MENU_DEBOUNCE_NS 50000000        
+#define MIN_VOLUME_CHANGE_INTERVAL_NS 300000000 // 300ms para evitar loops
+#define IOCTL_RETRY_DELAY_US 10000          
 #define MAX_IOCTL_RETRIES 3
 
 // Función para obtener tiempo actual
-static void get_current_time(struct timespec *ts)
-{
+static void get_current_time(struct timespec *ts) {
     clock_gettime(CLOCK_MONOTONIC, ts);
 }
 
 // Función para calcular diferencia en nanosegundos
-static long long timespec_diff_ns(const struct timespec *a, const struct timespec *b)
-{
+static long long timespec_diff_ns(const struct timespec *a, const struct timespec *b) {
     return (a->tv_sec - b->tv_sec) * 1000000000LL + (a->tv_nsec - b->tv_nsec);
 }
 
-// Función robusta para setear brillo con reintentos y rate limiting
-static int set_brightness_ioctl(int level)
-{
+// Verificar si un proceso debe ser ignorado
+static int should_ignore_process(const char* proc_name) {
+    int num_ignored = sizeof(ignored_processes) / sizeof(ignored_processes[0]);
+
+    for (int i = 0; i < num_ignored; i++) {
+        if (strstr(proc_name, ignored_processes[i]) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Obtener el nombre del proceso más reciente (no ignorado)
+static int get_newest_process(char* proc_name, size_t name_size) {
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) return 0;
+
+    struct dirent* entry;
+    time_t newest_time = 0;
+    char newest_name[MAX_PROC_NAME] = {0};
+    char comm_path[MAX_PATH_SIZE];
+    char comm_name[MAX_PROC_NAME];
+
+    while ((entry = readdir(proc_dir)) != NULL) {
+        // Solo directorios que sean números (PIDs)
+        if (!isdigit(entry->d_name[0])) continue;
+
+        // Leer el nombre del proceso desde /proc/PID/comm
+        snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", entry->d_name);
+        FILE* comm_file = fopen(comm_path, "r");
+        if (!comm_file) continue;
+
+        if (fgets(comm_name, sizeof(comm_name), comm_file)) {
+            // Quitar newline
+            char* nl = strchr(comm_name, '\n');
+            if (nl) *nl = '\0';
+
+            // Verificar si debemos ignorar este proceso
+            if (!should_ignore_process(comm_name)) {
+                // Obtener el tiempo de creación del proceso
+                char stat_path[MAX_PATH_SIZE];
+                snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", entry->d_name);
+
+                struct stat st;
+                if (stat(stat_path, &st) == 0) {
+                    if (st.st_mtime > newest_time) {
+                        newest_time = st.st_mtime;
+                        strncpy(newest_name, comm_name, sizeof(newest_name) - 1);
+                        newest_name[sizeof(newest_name) - 1] = '\0';
+                    }
+                }
+            }
+        }
+        fclose(comm_file);
+    }
+
+    closedir(proc_dir);
+
+    if (newest_name[0] != '\0') {
+        strncpy(proc_name, newest_name, name_size - 1);
+        proc_name[name_size - 1] = '\0';
+        return 1;
+    }
+
+    return 0;
+}
+
+// Guardar el último proceso conocido
+static void save_last_process(const char* proc_name) {
+    FILE* fp = fopen(LAST_PROCESS_FILE, "w");
+    if (fp) {
+        fprintf(fp, "%s\n", proc_name);
+        fclose(fp);
+    }
+}
+
+// Cargar el último proceso conocido
+static int load_last_process(char* proc_name, size_t name_size) {
+    FILE* fp = fopen(LAST_PROCESS_FILE, "r");
+    if (fp) {
+        if (fgets(proc_name, name_size, fp)) {
+            char* nl = strchr(proc_name, '\n');
+            if (nl) *nl = '\0';
+            fclose(fp);
+            return 1;
+        }
+        fclose(fp);
+    }
+    return 0;
+}
+
+// Guardar volumen persistente
+static void save_volume_to_file(int step) {
+    FILE* fp = fopen(VOLUME_PERSIST_FILE, "w");
+    if (fp) {
+        fprintf(fp, "%d\n", step);
+        fclose(fp);
+        persistent_volume_step = step;
+    }
+}
+
+// Cargar volumen persistente
+static int load_volume_from_file(void) {
+    FILE* fp = fopen(VOLUME_PERSIST_FILE, "r");
+    if (fp) {
+        int step = 3;
+        if (fscanf(fp, "%d", &step) == 1) {
+            fclose(fp);
+            if (step < 0) step = 0;
+            if (step > MAX_STEPS) step = MAX_STEPS;
+            persistent_volume_step = step;
+            return step;
+        }
+        fclose(fp);
+    }
+    persistent_volume_step = 3;
+    return 3;
+}
+
+// Función robusta para setear brillo
+static int set_brightness_ioctl(int level) {
     if (level < 0) level = 0;
     if (level > 7) level = 7;
 
-    // Rate limiting: evitar cambios muy rápidos
     struct timespec current_time;
     get_current_time(&current_time);
-
     if (timespec_diff_ns(&current_time, &last_brightness_change) < MIN_BRIGHTNESS_INTERVAL_NS) {
-        return 0; // Ignorar cambio muy rápido
+        return 0;
     }
 
     brightness_level = level;
@@ -66,7 +209,6 @@ static int set_brightness_ioctl(int level)
 
     unsigned long param[4] = {0, (unsigned long)brightness_values[level], 0, 0};
 
-    // Intentar múltiples veces para manejar "Operation not permitted"
     for (int retry = 0; retry < MAX_IOCTL_RETRIES; retry++) {
         int fd = open("/dev/disp", O_RDWR);
         if (fd < 0) {
@@ -80,31 +222,23 @@ static int set_brightness_ioctl(int level)
         int result = ioctl(fd, DISP_LCD_SET_BRIGHTNESS, param);
         close(fd);
 
-        if (result == 0) {
-            return 0; // Éxito
-        }
+        if (result == 0) return 0;
 
-        // Si falla por EPERM u otros errores recuperables, reintentar
         if (errno == EPERM || errno == EBUSY || errno == EAGAIN) {
             if (retry < MAX_IOCTL_RETRIES - 1) {
-                usleep(IOCTL_RETRY_DELAY_US * (retry + 1)); // Backoff exponencial
+                usleep(IOCTL_RETRY_DELAY_US * (retry + 1));
                 continue;
             }
         } else {
-            // Error no recuperable
             break;
         }
     }
-
     return -1;
 }
 
-// Función mejorada para leer brillo (solo se llama al inicio)
-static int get_brightness_ioctl(int *level)
-{
-    if (brightness_get_supported == 0) {
-        return -1;
-    }
+// Función para leer brillo actual (Allwinner)
+static int get_brightness_ioctl(int *level) {
+    if (brightness_get_supported == 0) return -1;
 
     int fd = open("/dev/disp", O_RDWR);
     if (fd < 0) {
@@ -114,10 +248,9 @@ static int get_brightness_ioctl(int *level)
 
     unsigned long param[4];
 
-    // Probar diferentes formatos de parámetros para drivers Sunxi/Allwinner
-    // Intento 1: Formato estándar con display ID
+    // Formato estándar Allwinner
     memset(param, 0, sizeof(param));
-    param[0] = 0; // Display ID 0
+    param[0] = 0;
     if (ioctl(fd, DISP_LCD_GET_BRIGHTNESS, param) == 0) {
         if (param[1] > 0 && param[1] <= 255) {
             goto brightness_found;
@@ -128,16 +261,15 @@ static int get_brightness_ioctl(int *level)
         }
     }
 
-    // Intento 2: Formato alternativo
+    // Formato alternativo
     memset(param, 0, sizeof(param));
-    param[0] = 1; // Display ID diferente
+    param[0] = 1;
     if (ioctl(fd, DISP_LCD_GET_BRIGHTNESS, param) == 0) {
         if (param[1] > 0 && param[1] <= 255) {
             goto brightness_found;
         }
     }
 
-    // Si no funciona, marcar como no soportado
     brightness_get_supported = 0;
     close(fd);
     return -1;
@@ -146,7 +278,7 @@ brightness_found:
     close(fd);
     brightness_get_supported = 1;
 
-    // Buscar índice correspondiente
+    // Encontrar el índice correspondiente
     for (int i = 0; i < 8; i++) {
         if (brightness_values[i] == (int)param[1]) {
             *level = i;
@@ -154,7 +286,7 @@ brightness_found:
         }
     }
 
-    // Buscar el más cercano
+    // Encontrar el más cercano
     int closest_i = 0;
     int closest_diff = abs(brightness_values[0] - (int)param[1]);
     for (int i = 1; i < 8; i++) {
@@ -168,15 +300,13 @@ brightness_found:
     return 0;
 }
 
-// Función para manejar eventos con debouncing
-static int handle_menu_event(int pressed)
-{
+// Manejo de eventos con debouncing
+static int handle_menu_event(int pressed) {
     struct timespec current_time;
     get_current_time(&current_time);
 
-    // Debouncing: ignorar eventos muy rápidos
     if (timespec_diff_ns(&current_time, &last_menu_event) < MIN_MENU_DEBOUNCE_NS) {
-        return menu_long_pressed; // Retornar estado anterior
+        return menu_long_pressed;
     }
 
     last_menu_event = current_time;
@@ -184,105 +314,248 @@ static int handle_menu_event(int pressed)
     return menu_long_pressed;
 }
 
-// Función para sincronizar brillo inicial (solo una vez)
-static void sync_brightness_level(void)
-{
+// Sincronizar brillo inicial
+static void sync_brightness_level(void) {
     int detected_level;
     if (get_brightness_ioctl(&detected_level) == 0) {
         brightness_level = detected_level;
     }
-    // Si no puede leer, mantiene valor por defecto (nivel 3)
 }
 
-// Convierte paso 0-10 a valor real 0-31
+// Convertir paso a volumen ALSA
 int stepToVolume(int step) {
     if (step < 0) step = 0;
     if (step > MAX_STEPS) step = MAX_STEPS;
     return (step * MAX_VOLUME) / MAX_STEPS;
 }
 
-// Obtiene el volumen actual como paso 0-10
+// Obtener volumen actual del sistema
 int getVolumeStep() {
-    FILE *pipe = popen("amixer get 'lineout volume' | grep -o '[0-9]*%' | head -1", "r");
+    FILE* pipe = popen("amixer get 'lineout volume' 2>/dev/null | grep -o '[0-9]*%' | head -1", "r");
     if (!pipe) return -1;
+
     char buf[16];
     if (fgets(buf, sizeof(buf), pipe) != NULL) {
         int percent = 0;
         sscanf(buf, "%d", &percent);
         pclose(pipe);
+
         int volume = (percent * MAX_VOLUME) / 100;
-        int step = (volume * MAX_STEPS + MAX_VOLUME/2) / MAX_VOLUME; // redondeo
+        int step = (volume * MAX_STEPS + MAX_VOLUME/2) / MAX_VOLUME;
         if (step < 0) step = 0;
         if (step > MAX_STEPS) step = MAX_STEPS;
         return step;
     }
+
     pclose(pipe);
     return -1;
 }
 
-// Establece volumen desde paso 0-10
+// Establecer volumen con rate limiting y persistencia
 void setVolumeStep(int step) {
+    struct timespec current_time;
+    get_current_time(&current_time);
+
+    // Rate limiting
+    if (timespec_diff_ns(&current_time, &last_volume_change) < MIN_VOLUME_CHANGE_INTERVAL_NS) {
+        return;
+    }
+
     if (step < 0) step = 0;
     if (step > MAX_STEPS) step = MAX_STEPS;
+
+    last_volume_change = current_time;
+    skip_next_restore = 1; // Evitar restauración inmediata
+
     int vol = stepToVolume(step);
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "amixer set 'lineout volume' %d", vol);
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "amixer set 'lineout volume' %d 2>/dev/null >/dev/null", vol);
     int ret = system(cmd);
-	(void)ret;
+    (void)ret;
+
+    // Guardar volumen inmediatamente
+    save_volume_to_file(step);
+
+    printf("[keymon] Volumen establecido: %d%% (amixer: %d)\n", (step * 100) / MAX_STEPS, vol);
+
+    // Pequeño delay para estabilizar
+    usleep(100000); // 100ms
 }
 
-int main()
-{
-    // Intentar sincronizar con brillo actual al iniciar (una sola vez)
+// Función CLAVE: Detectar nuevos procesos y restaurar volumen
+static void check_and_restore_on_new_process(void) {
+    time_t current_time = time(NULL);
+
+    // Solo verificar cada cierto intervalo
+    if (current_time - last_process_check < PROCESS_CHECK_INTERVAL) {
+        return;
+    }
+
+    last_process_check = current_time;
+
+    // Si acabamos de cambiar el volumen, esperar
+    if (skip_next_restore) {
+        skip_next_restore = 0;
+        return;
+    }
+
+    char current_proc[MAX_PROC_NAME];
+    char last_proc[MAX_PROC_NAME] = {0};
+
+    // Obtener el proceso más reciente
+    if (!get_newest_process(current_proc, sizeof(current_proc))) {
+        return;
+    }
+
+    // Cargar el último proceso conocido
+    load_last_process(last_proc, sizeof(last_proc));
+
+    // Si hay un proceso nuevo diferente
+    if (strcmp(current_proc, last_proc) != 0) {
+        printf("[keymon] Nueva aplicación detectada: '%s' (anterior: '%s')\n", 
+               current_proc, last_proc);
+
+        // Obtener volumen actual del sistema
+        int system_volume = getVolumeStep();
+
+        // Si el volumen cambió significativamente, restaurar el persistente
+        if (system_volume >= 0) {
+            int diff = abs(system_volume - persistent_volume_step);
+
+            if (diff > 1) {
+                printf("[keymon] Restaurando volumen: %d%% -> %d%%\n", 
+                       (system_volume * 100) / MAX_STEPS, 
+                       (persistent_volume_step * 100) / MAX_STEPS);
+
+                // Restaurar volumen guardado
+                int vol = stepToVolume(persistent_volume_step);
+                char cmd[128];
+                snprintf(cmd, sizeof(cmd), "amixer set 'lineout volume' %d 2>/dev/null >/dev/null", vol);
+                int ret = system(cmd);
+                (void)ret;
+            }
+        }
+
+        // Guardar el nuevo proceso como conocido
+        save_last_process(current_proc);
+    }
+}
+
+// Cleanup al salir
+static void cleanup_and_exit(int sig) {
+    (void)sig;
+    printf("[keymon] Saliendo...\n");
+    exit(0);
+}
+
+int main() {
+    printf("[keymon] Iniciando con auto-restore de volumen para RG34XXM...\n");
+
+    // Configurar señales
+    signal(SIGINT, cleanup_and_exit);
+    signal(SIGTERM, cleanup_and_exit);
+
+    // Sincronizar brillo inicial
     sync_brightness_level();
 
+    // Abrir device de input
     int input_fd = open("/dev/input/event1", O_RDONLY);
-    if (input_fd < 0)
+    if (input_fd < 0) {
+        printf("[keymon] Error: No se puede abrir /dev/input/event1\n");
         return 1;
-    
-    int step = getVolumeStep();
+    }
+
+    // Cargar volumen persistente
+    int step = load_volume_from_file();
+
+    // Verificar y posiblemente restaurar volumen inicial
+    int current_system_step = getVolumeStep();
+    if (current_system_step >= 0 && abs(current_system_step - step) > 1) {
+        printf("[keymon] Restaurando volumen inicial: %d%% -> %d%%\n", 
+               (current_system_step * 100) / MAX_STEPS, 
+               (step * 100) / MAX_STEPS);
+        setVolumeStep(step);
+    } else if (current_system_step >= 0) {
+        step = current_system_step;
+        save_volume_to_file(step);
+    }
+
+    // Inicializar detección de procesos
+    char initial_proc[MAX_PROC_NAME];
+    if (get_newest_process(initial_proc, sizeof(initial_proc))) {
+        save_last_process(initial_proc);
+        printf("[keymon] Proceso inicial detectado: '%s'\n", initial_proc);
+    }
+
+    printf("[keymon] Listo - Volumen: %d%%, Brillo: %d\n", 
+           (step * 100) / MAX_STEPS, brightness_level);
+    printf("[keymon] Auto-restore activado cada %d segundos\n", PROCESS_CHECK_INTERVAL);
 
     struct input_event ev;
 
     while (1) {
-        ssize_t n = read(input_fd, &ev, sizeof(ev));
-        if (n != sizeof(ev))
-            continue;
+        // FUNCIÓN CLAVE: Verificar nuevos procesos y restaurar volumen
+        check_and_restore_on_new_process();
 
-        if (ev.type == EV_KEY) {
-            if (ev.value == 1) { // PRESSED
-                switch (ev.code) {
-                    case KEY_MENU_LONG:
-                        handle_menu_event(1);
-                        break;
+        // Leer eventos de input con timeout
+        fd_set read_fds;
+        struct timeval timeout;
 
-                    case KEY_VOLUP:
-                        if (menu_long_pressed) {
-                            set_brightness_ioctl(brightness_level + 1);
-                        } else {
-                            if (step < MAX_STEPS) {
-                                step++;
-                                setVolumeStep(step);
-                            }
-                        } 
-                        break;
+        FD_ZERO(&read_fds);
+        FD_SET(input_fd, &read_fds);
+        timeout.tv_sec = 1;  // 1 segundo timeout
+        timeout.tv_usec = 0;
 
-                    case KEY_VOLDOWN:
-                        if (menu_long_pressed) {
-                            set_brightness_ioctl(brightness_level - 1);
-                        } else {
-                            if (step > 0) {
-                                step--;
-                                setVolumeStep(step);
-                            }
-                        } 
-                        break;
-                }
+        int ready = select(input_fd + 1, &read_fds, NULL, NULL, &timeout);
+
+        if (ready < 0) {
+            if (errno != EINTR) {
+                perror("select");
+                break;
             }
-            else if (ev.value == 0) { // RELEASED
-                if (ev.code == KEY_MENU_LONG) {
-                    handle_menu_event(0);
-                }
+            continue;
+        }
+
+        if (ready == 0) {
+            // Timeout - continuar verificación de procesos
+            continue;
+        }
+
+        // Leer evento de input
+        ssize_t n = read(input_fd, &ev, sizeof(ev));
+        if (n != sizeof(ev)) continue;
+
+        if (ev.type == EV_KEY && ev.value == 1) { // PRESSED
+            switch (ev.code) {
+                case KEY_MENU_LONG:
+                    handle_menu_event(1);
+                    break;
+
+                case KEY_VOLUP:
+                    if (menu_long_pressed) {
+                        set_brightness_ioctl(brightness_level + 1);
+                    } else {
+                        if (step < MAX_STEPS) {
+                            step++;
+                            setVolumeStep(step);
+                        }
+                    }
+                    break;
+
+                case KEY_VOLDOWN:
+                    if (menu_long_pressed) {
+                        set_brightness_ioctl(brightness_level - 1);
+                    } else {
+                        if (step > 0) {
+                            step--;
+                            setVolumeStep(step);
+                        }
+                    }
+                    break;
+            }
+        } else if (ev.type == EV_KEY && ev.value == 0) { // RELEASED
+            if (ev.code == KEY_MENU_LONG) {
+                handle_menu_event(0);
             }
         }
     }
