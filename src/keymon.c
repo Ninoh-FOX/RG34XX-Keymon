@@ -1,17 +1,17 @@
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <linux/input.h>
-#include <sys/ioctl.h>
-#include <errno.h>
 #include <string.h>
 #include <time.h>
-#include <math.h>
+#include <unistd.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <signal.h>
-#include <dirent.h>
-#include <ctype.h>
 
 #define KEY_MENU_LONG 312 // BTN_TL2
 #define KEY_VOLUP 115     // KEY_VOLUMEUP
