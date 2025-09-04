@@ -47,10 +47,11 @@ static int persistent_volume_step = 3;
 static int skip_next_restore = 0;
 
 static const char* ignored_processes[] = {
-    "keymon", "init", "kthreadd", "ksoftirqd", 
-    "migration", "rcu_", "systemd", "dbus", "getty", "sshd",
-    "kernel", "worker", "irq/", "mmcqd", "jbd2", "ext4-", 
-    "led_workqueue", "cfg80211", "wpa_supplicant", "dhcpcd",
+    "keymon", "init", "kthreadd", "ksoftirqd", "lru-add-drain",
+    "sleep", "nmcli", "vmstat", "spy", "kbase_event", "nm-dispatcher",
+    "migration", "rcu_", "systemd", "dbus", "getty", "sshd", "sftp-server",
+    "kernel", "worker", "irq/", "mmcqd", "jbd2", "ext4-", "tail",
+    "led_workqueue", "cfg80211", "wpa_supplicant", "dhcpcd", "find",
     "NetworkManager", "chronyd", "rsyslog", "cron", "bash", "sh"
 };
 
