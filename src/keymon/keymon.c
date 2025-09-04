@@ -24,6 +24,7 @@
 // Archivos de persistencia
 #define VOLUME_PERSIST_FILE "/.config/.keymon_volume"
 #define LAST_PROCESS_FILE "/.config/.keymon_lastproc"
+#define BRIGHTNESS_PERSIST_FILE "/.config/.keymon_brightness"
 
 // Configuración de monitoreo
 #define PROCESS_CHECK_INTERVAL 2  // segundos entre verificaciones de procesos
@@ -193,6 +194,30 @@ static int load_volume_from_file(void) {
     return 3;
 }
 
+static void save_brightness_to_file(int level) {
+    FILE* fp = fopen(BRIGHTNESS_PERSIST_FILE, "w");
+    if (fp) {
+        fprintf(fp, "%d\n", level);
+        fclose(fp);
+    }
+}
+
+// Cargar brillo persistente
+static int load_brightness_from_file(void) {
+    FILE* fp = fopen(BRIGHTNESS_PERSIST_FILE, "r");
+    if (fp) {
+        int level = 3;
+        if (fscanf(fp, "%d", &level) == 1) {
+            fclose(fp);
+            if (level < 0) level = 0;
+            if (level > 7) level = 7;
+            return level;
+        }
+        fclose(fp);
+    }
+    return 3; // Default
+}
+
 // Función robusta para setear brillo
 static int set_brightness_ioctl(int level) {
     if (level < 0) level = 0;
@@ -222,7 +247,10 @@ static int set_brightness_ioctl(int level) {
         int result = ioctl(fd, DISP_LCD_SET_BRIGHTNESS, param);
         close(fd);
 
-        if (result == 0) return 0;
+        if (result == 0) {
+            save_brightness_to_file(level);
+            return 0;
+        }
 
         if (errno == EPERM || errno == EBUSY || errno == EAGAIN) {
             if (retry < MAX_IOCTL_RETRIES - 1) {
@@ -319,6 +347,8 @@ static void sync_brightness_level(void) {
     int detected_level;
     if (get_brightness_ioctl(&detected_level) == 0) {
         brightness_level = detected_level;
+    } else {
+        brightness_level = load_brightness_from_file();
     }
 }
 
@@ -453,6 +483,7 @@ int main() {
 
     // Sincronizar brillo inicial
     sync_brightness_level();
+    
 
     // Abrir device de input
     int input_fd = open("/dev/input/event1", O_RDONLY);
