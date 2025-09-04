@@ -16,7 +16,7 @@
 #define KEY_MENU_LONG 312 // BTN_TL2
 #define KEY_VOLUP 115     // KEY_VOLUMEUP
 #define KEY_VOLDOWN 114   // KEY_VOLUMEDOWN
-#define MAX_STEPS 10
+#define MAX_STEPS 16
 #define MAX_VOLUME 31
 
 #define MAX_PATH_SIZE 512
@@ -331,22 +331,18 @@ int stepToVolume(int step) {
 
 // Obtener volumen actual del sistema
 int getVolumeStep() {
-    FILE* pipe = popen("amixer get 'lineout volume' 2>/dev/null | grep -o '[0-9]*%' | head -1", "r");
+    FILE* pipe = popen("tinymix get 2 2>/dev/null", "r");
     if (!pipe) return -1;
-
-    char buf[16];
+    char buf[32];
     if (fgets(buf, sizeof(buf), pipe) != NULL) {
-        int percent = 0;
-        sscanf(buf, "%d", &percent);
+        int value = 0;
+        sscanf(buf, "%d", &value);
         pclose(pipe);
-
-        int volume = (percent * MAX_VOLUME) / 100;
-        int step = (volume * MAX_STEPS + MAX_VOLUME/2) / MAX_VOLUME;
+        int step = (value * MAX_STEPS + MAX_VOLUME/2) / MAX_VOLUME;
         if (step < 0) step = 0;
         if (step > MAX_STEPS) step = MAX_STEPS;
         return step;
     }
-
     pclose(pipe);
     return -1;
 }
@@ -369,14 +365,14 @@ void setVolumeStep(int step) {
 
     int vol = stepToVolume(step);
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "amixer set 'lineout volume' %d 2>/dev/null >/dev/null", vol);
+    snprintf(cmd, sizeof(cmd), "tinymix set 2 %d 2>/dev/null >/dev/null", vol);
     int ret = system(cmd);
     (void)ret;
 
     // Guardar volumen inmediatamente
     save_volume_to_file(step);
 
-    printf("[keymon] Volumen establecido: %d%% (amixer: %d)\n", (step * 100) / MAX_STEPS, vol);
+    printf("[keymon] VOL: %d%% (tinymix: %d (range 0->31))\n", (step * 100) / MAX_STEPS, vol);
 
     // Pequeño delay para estabilizar
     usleep(100000); // 100ms
@@ -430,7 +426,7 @@ static void check_and_restore_on_new_process(void) {
                 // Restaurar volumen guardado
                 int vol = stepToVolume(persistent_volume_step);
                 char cmd[128];
-                snprintf(cmd, sizeof(cmd), "amixer set 'lineout volume' %d 2>/dev/null >/dev/null", vol);
+                snprintf(cmd, sizeof(cmd), "tinymix set 2 %d 2>/dev/null >/dev/null", vol);
                 int ret = system(cmd);
                 (void)ret;
             }
