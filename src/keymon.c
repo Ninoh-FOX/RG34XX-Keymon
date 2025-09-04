@@ -22,8 +22,8 @@
 #define MAX_PATH_SIZE 512
 
 // Archivos de persistencia
-#define VOLUME_PERSIST_FILE "/tmp/.keymon_volume"
-#define LAST_PROCESS_FILE "/tmp/.keymon_lastproc"
+#define VOLUME_PERSIST_FILE "/.config/.keymon_volume"
+#define LAST_PROCESS_FILE "/.config/.keymon_lastproc"
 
 // Configuración de monitoreo
 #define PROCESS_CHECK_INTERVAL 2  // segundos entre verificaciones de procesos
